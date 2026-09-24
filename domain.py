@@ -9,10 +9,14 @@
 4. 策展展签：发布日期确认后锁定证据快照，后来的学术更正只产生新版，
    不改变旧版展签；任意版本都可从展签定位到实体、贡献区段、当前保管
    责任、授权范围与未解除风险。
+5. 损伤理赔：报案锁定事故发生时有效的保险条款、交接双方签认与图像摘要；
+   四方按角色追加材料且各成新版本；资金分录保持金额守恒、回执幂等；
+   理赔关闭与作品解冻分别判断，未获授权的机构看不到作品敏感材料。
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -51,6 +55,24 @@ TRANSFER_PAIRS = {
 }
 
 LABEL_STATUS = ("草拟", "已发布", "已更正")
+
+# 理赔参与角色：在借展角色之外引入保险方
+CLAIM_ROLES = ("保险方", "出借馆", "承借馆", "运输方")
+
+# 补充材料类型；除异议向所有当事方开放外，每种材料都有固定提交角色
+SUBMISSION_KINDS = ("估损", "异议", "修复方案", "责任意见")
+SUBMISSION_KIND_ROLES = {
+    "估损": ("保险方",),
+    "修复方案": ("承借馆",),
+    "责任意见": ("出借馆", "运输方"),
+    "异议": CLAIM_ROLES,
+}
+
+# 资金分录类型：认可与免赔由理赔决定一并登记，赔付与追偿逐笔追加
+ENTRY_KINDS = ("认可", "免赔", "赔付", "追偿")
+
+# 理赔阶段（由案件状态推导，不直接赋值）
+CLAIM_STAGES = ("已报案", "定损中", "已决定", "赔付中", "已结清", "已关闭")
 
 
 class DomainError(ValueError):
@@ -199,6 +221,8 @@ class Incident:
     after_hashes: list[str]
     resolved: bool = False
     resolution_note: str = ""
+    agreement_id: Optional[str] = None  # 事故发生时有效的协议版本
+    claim_id: Optional[str] = None  # 该事件已报案的理赔案
 
 
 @dataclass
@@ -214,6 +238,66 @@ class LabelVersion:
     frozen: bool
 
 
+@dataclass
+class ClaimSubmission:
+    """补充材料的一个不可变版本：估损/异议/修复方案/责任意见。"""
+
+    version: int
+    kind: str
+    by: Signature
+    summary: str
+    amount_cents: Optional[int]
+    image_hashes: list[str]
+    submitted_on: str
+
+
+@dataclass
+class FundEntry:
+    """资金分录：认可/免赔/赔付/追偿，逐笔追加，保持金额守恒。"""
+
+    seq: int
+    kind: str
+    amount_cents: int
+    receipt_id: str
+    by_org: str
+    note: str
+    recorded_on: str
+
+
+@dataclass
+class ClaimDecision:
+    """理赔决定：认可金额（可部分认可）、免赔额与被引用的材料版本。"""
+
+    by: Signature
+    approved_cents: int
+    deductible_cents: int
+    cited_versions: list[int]
+    decided_on: str
+    note: str
+
+
+@dataclass
+class Claim:
+    """理赔案：报案时锁定基准证据，之后只追加，不替换。"""
+
+    claim_id: str
+    work_id: str
+    incident_id: str
+    insurer_org: str
+    filed_by: Signature
+    filed_on: str
+    baseline: dict[str, Any]
+    submissions: list[ClaimSubmission] = field(default_factory=list)
+    decision: Optional[ClaimDecision] = None
+    ledger: list[FundEntry] = field(default_factory=list)
+    restoration_reviewed: bool = False
+    restoration_review_note: str = ""
+    custody_acknowledged: bool = False
+    custody_ack_by: str = ""
+    closed: bool = False
+    closed_on: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # 领域服务
 # ---------------------------------------------------------------------------
@@ -222,8 +306,8 @@ class LabelVersion:
 class LoanRegistry:
     """保存全部借展记录并强制业务规则。
 
-    对外使用命令式方法（register_work / record_handover / ...），
-    查询通过 get_work_view / label_version / risk_view 等只读视图。
+    对外使用命令式方法（register_work / record_handover / file_claim / ...），
+    查询通过 get_work_view / label_version / risk_view / claim_view 等只读视图。
     """
 
     def __init__(self) -> None:
@@ -235,6 +319,7 @@ class LoanRegistry:
         self.incidents: list[Incident] = []
         self._frozen_works: set[str] = set()
         self.labels: dict[str, list[LabelVersion]] = {}
+        self.claims: dict[str, Claim] = {}
 
     # -- 作品结构 ----------------------------------------------------------
 
@@ -423,6 +508,7 @@ class LoanRegistry:
 
         if handover.damaged:
             self._frozen_works.add(work.work_id)
+            agreement = self._current_agreement(work.work_id)
             incident = Incident(
                 incident_id=_new_id("incident"),
                 work_id=work.work_id,
@@ -431,6 +517,7 @@ class LoanRegistry:
                 note=report.damage_note,
                 before_hashes=list(report.before_hashes),
                 after_hashes=list(report.after_hashes),
+                agreement_id=agreement.agreement_id if agreement else None,
             )
             self.incidents.append(incident)
             return self._handover_view(handover, frozen=True, incident_id=incident.incident_id)
@@ -438,12 +525,27 @@ class LoanRegistry:
         return self._handover_view(handover, frozen=False)
 
     def resolve_incident(self, incident_id: str, resolution_note: str) -> dict[str, Any]:
-        """损伤经双方确认解除后解冻；解除前风险一直挂账。"""
+        """损伤经双方确认解除后解冻；解除前风险一直挂账。
+
+        已报案的损伤须同时满足出借馆修复复核与保管责任确认才能解冻，
+        与理赔是否关闭分别判断。
+        """
         incident = next((i for i in self.incidents if i.incident_id == incident_id), None)
         if incident is None:
             raise DomainError(f"损伤事件 {incident_id} 不存在")
         if not resolution_note or not resolution_note.strip():
             raise DomainError("解除损伤须填写处理与复核结论")
+        claim = next((c for c in self.claims.values() if c.incident_id == incident.incident_id), None)
+        if claim is not None:
+            missing = []
+            if not claim.restoration_reviewed:
+                missing.append("出借馆修复复核")
+            if not claim.custody_acknowledged:
+                missing.append("保管责任确认")
+            if missing:
+                raise ConflictError(
+                    f"理赔 {claim.claim_id} 尚未满足解冻条件：{'、'.join(missing)}"
+                )
         incident.resolved = True
         incident.resolution_note = resolution_note.strip()
         self._frozen_works.discard(incident.work_id)
@@ -496,6 +598,487 @@ class LoanRegistry:
         if re.fullmatch(r"[0-9a-fA-F]{64}", value):
             return value.lower()
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    # -- 损伤理赔 ----------------------------------------------------------
+
+    def file_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """报案：锁定事故发生时有效的保险条款、交接双方签认与图像摘要。
+
+        锁定的基准取自损伤事件登记时的协议版本；此后跨馆改期只产生新的
+        协议版本，不改变本案的保障范围。
+        """
+        work = self._work(payload["work_id"])
+        incident = next(
+            (i for i in self.incidents if i.incident_id == payload.get("incident_id")), None
+        )
+        if incident is None:
+            raise DomainError(f"损伤事件 {payload.get('incident_id')} 不存在")
+        if incident.work_id != work.work_id:
+            raise DomainError("损伤事件不属于该作品")
+        if incident.resolved:
+            raise ConflictError("损伤已复核解除，不能再就该事件报案")
+        if incident.claim_id:
+            raise ConflictError(
+                f"损伤事件 {incident.incident_id} 已报案（{incident.claim_id}），不能重复报案"
+            )
+        if not incident.agreement_id or incident.agreement_id not in self.agreements:
+            raise DomainError("事故发生时无有效借展协议，无法锁定保险条款")
+        agreement = self.agreements[incident.agreement_id]
+        if not agreement.insurance:
+            raise DomainError("事故时有效的协议未约定保险条款，不能报案")
+
+        insurer_org = str(payload.get("insurer_org", "") or "").strip()
+        if not insurer_org:
+            raise DomainError("报案须指明保险方机构")
+
+        filed_by = self._claim_signature(payload.get("filed_by") or {})
+        if filed_by.role not in ("出借馆", "承借馆"):
+            raise DomainError("报案人须为出借馆或承借馆")
+        expected_org = agreement.lender_org if filed_by.role == "出借馆" else agreement.borrower_org
+        if filed_by.org != expected_org:
+            raise DomainError(f"{filed_by.role}报案机构须为 {expected_org}，收到 {filed_by.org}")
+
+        filed_on = self._date(payload["filed_on"], "报案日期")
+        if filed_on.isoformat() < incident.on_date:
+            raise DomainError("报案日期不能早于事故日期")
+
+        handover = next(h for h in self.handovers if h.handover_id == incident.handover_id)
+        baseline = {
+            "agreement_id": agreement.agreement_id,
+            "agreement_version": agreement.version,
+            "insurance": copy.deepcopy(agreement.insurance),
+            "handover_id": handover.handover_id,
+            "incident_on": incident.on_date,
+            "signatures": {
+                "from_party": {
+                    "org": handover.from_party.org,
+                    "role": handover.from_party.role,
+                    "person": handover.from_party.person,
+                },
+                "to_party": {
+                    "org": handover.to_party.org,
+                    "role": handover.to_party.role,
+                    "person": handover.to_party.person,
+                },
+            },
+            "image_digests": {
+                "before_hashes": list(incident.before_hashes),
+                "after_hashes": list(incident.after_hashes),
+                "handover_hashes": list(handover.report.image_hashes),
+            },
+        }
+        claim = Claim(
+            claim_id=_new_id("claim"),
+            work_id=work.work_id,
+            incident_id=incident.incident_id,
+            insurer_org=insurer_org,
+            filed_by=filed_by,
+            filed_on=filed_on.isoformat(),
+            baseline=baseline,
+        )
+        self.claims[claim.claim_id] = claim
+        incident.claim_id = claim.claim_id
+        return self.claim_view(claim.claim_id, viewer_org=filed_by.org)
+
+    def add_submission(self, claim_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """按角色追加补充材料；每次追加都形成新版本，旧版本永不替换。"""
+        claim = self._claim(claim_id)
+        if claim.closed:
+            raise ConflictError("理赔案已关闭，不能再追加材料")
+        kind = payload.get("kind", "")
+        if kind not in SUBMISSION_KINDS:
+            raise DomainError(f"补充材料类型须为 {SUBMISSION_KINDS} 之一")
+        by = self._assert_claim_party(claim, payload.get("by") or {}, SUBMISSION_KIND_ROLES[kind])
+        summary = str(payload.get("summary", "") or "").strip()
+        if not summary:
+            raise DomainError("补充材料须填写摘要")
+        amount_cents: Optional[int] = None
+        if kind == "估损":
+            amount_cents = self._cents(payload.get("amount"), "估损金额")
+            if amount_cents <= 0:
+                raise DomainError("估损金额须为正数")
+        submitted_on = str(payload.get("submitted_on") or date.today().isoformat())
+        self._date(submitted_on, "提交日期")
+        submission = ClaimSubmission(
+            version=len(claim.submissions) + 1,
+            kind=kind,
+            by=by,
+            summary=summary,
+            amount_cents=amount_cents,
+            image_hashes=[self._image_hash(h) for h in payload.get("image_hashes", [])],
+            submitted_on=submitted_on,
+        )
+        claim.submissions.append(submission)
+        view = self._submission_view(claim, submission)
+        view["claim_id"] = claim.claim_id
+        view["stage"] = self._claim_stage(claim)
+        return view
+
+    def decide_claim(self, claim_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """保险方理赔决定：部分认可与免赔额入账，引用材料版本；决定只生效一次。"""
+        claim = self._claim(claim_id)
+        if claim.closed:
+            raise ConflictError("理赔案已关闭")
+        if claim.decision is not None:
+            raise ConflictError("理赔决定已登记，并发或重复决定不得再次生效")
+        by = self._assert_claim_party(claim, payload.get("by") or {}, ("保险方",))
+        approved = self._cents(payload.get("approved_amount"), "认可金额")
+        deductible = self._cents(payload.get("deductible", 0), "免赔额")
+        if approved < 0 or deductible < 0:
+            raise DomainError("认可金额与免赔额不能为负")
+        if deductible > approved:
+            raise DomainError("免赔额不能超过认可金额")
+        known = {s.version for s in claim.submissions}
+        cited = [int(v) for v in payload.get("cited_versions", [])]
+        for version in cited:
+            if version not in known:
+                raise DomainError(f"材料版本 v{version} 不存在，不能被决定引用")
+        decided_on = str(payload.get("decided_on") or date.today().isoformat())
+        self._date(decided_on, "决定日期")
+        claim.decision = ClaimDecision(
+            by=by,
+            approved_cents=approved,
+            deductible_cents=deductible,
+            cited_versions=cited,
+            decided_on=decided_on,
+            note=str(payload.get("note", "") or ""),
+        )
+        # 认可与免赔作为首两笔资金分录入账，之后的赔付/追偿在此基础上守恒。
+        self._append_entry(claim, "认可", approved, f"{claim.claim_id}-决定-认可",
+                           by.org, "理赔决定认可金额", decided_on)
+        if deductible:
+            self._append_entry(claim, "免赔", deductible, f"{claim.claim_id}-决定-免赔",
+                               by.org, "理赔决定免赔额", decided_on)
+        return self.claim_view(claim.claim_id, viewer_org=by.org)
+
+    def append_entry(self, claim_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """追加赔付/追偿分录：回执唯一（幂等），并保持金额守恒。"""
+        claim = self._claim(claim_id)
+        if claim.closed:
+            raise ConflictError("理赔案已关闭，不能再登记资金分录")
+        if claim.decision is None:
+            raise ConflictError("须先完成理赔决定，才能登记赔付或追偿")
+        kind = payload.get("kind", "")
+        if kind not in ("赔付", "追偿"):
+            raise DomainError("资金分录类型须为 赔付 或 追偿（认可与免赔由理赔决定登记）")
+        by = self._assert_claim_party(claim, payload.get("by") or {}, ("保险方",))
+        amount = self._cents(payload.get("amount"), "分录金额")
+        if amount <= 0:
+            raise DomainError("分录金额须为正数")
+        receipt_id = str(payload.get("receipt_id", "") or "").strip()
+        if not receipt_id:
+            raise DomainError("资金分录须附回执编号")
+        recorded_on = str(payload.get("recorded_on") or date.today().isoformat())
+        self._date(recorded_on, "登记日期")
+        entry = self._append_entry(
+            claim, kind, amount, receipt_id, by.org,
+            str(payload.get("note", "") or ""), recorded_on,
+        )
+        view = self._entry_view(entry)
+        view["claim_id"] = claim.claim_id
+        view["stage"] = self._claim_stage(claim)
+        view["funds"] = self._funds_view(claim)
+        return view
+
+    def review_restoration(self, claim_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """出借馆修复复核：解冻的两个前提之一；通过后结论不得更改。"""
+        claim = self._claim(claim_id)
+        by = self._assert_claim_party(claim, payload.get("by") or {}, ("出借馆",))
+        if not any(s.kind == "修复方案" for s in claim.submissions):
+            raise DomainError("承借馆尚未提交修复方案，不能复核")
+        if claim.restoration_reviewed:
+            raise ConflictError("修复复核已通过，结论不得更改")
+        conclusion = payload.get("conclusion", "")
+        if conclusion not in ("通过", "不通过"):
+            raise DomainError("复核结论须为 通过 或 不通过")
+        claim.restoration_review_note = str(payload.get("note", "") or "").strip()
+        if conclusion == "通过":
+            claim.restoration_reviewed = True
+        return {
+            "claim_id": claim.claim_id,
+            "conclusion": conclusion,
+            "restoration_reviewed": claim.restoration_reviewed,
+            "reviewed_by": by.org,
+        }
+
+    def acknowledge_custody(self, claim_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """当前保管方确认保管责任：解冻的另一个前提。"""
+        claim = self._claim(claim_id)
+        by = payload.get("by") or {}
+        org = str(by.get("org", "") or "").strip()
+        person = str(by.get("person", "") or "").strip()
+        if not person:
+            raise DomainError("须指定签认人")
+        custodian = self._custody(claim.work_id)["custodian_org"]
+        if org != custodian:
+            raise DomainError(f"当前保管方为 {custodian}，保管责任须由其确认，收到 {org or '空'}")
+        if claim.custody_acknowledged:
+            raise ConflictError("保管责任已确认，不能重复签认")
+        claim.custody_acknowledged = True
+        claim.custody_ack_by = org
+        return {
+            "claim_id": claim.claim_id,
+            "custody_acknowledged": True,
+            "acknowledged_by": org,
+        }
+
+    def close_claim(self, claim_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """关闭理赔：须赔付结清；与作品解冻分别判断，互不为前提。"""
+        claim = self._claim(claim_id)
+        self._assert_claim_party(claim, payload.get("by") or {}, ("保险方",))
+        if claim.closed:
+            raise ConflictError("理赔案已关闭")
+        if claim.decision is None:
+            raise ConflictError("尚未完成理赔决定，不能关闭")
+        if self._fund_totals(claim)["outstanding"] > 0:
+            raise ConflictError("赔付未结清，不能关闭理赔")
+        claim.closed = True
+        claim.closed_on = str(payload.get("closed_on") or date.today().isoformat())
+        self._date(claim.closed_on, "关闭日期")
+        return {
+            "claim_id": claim.claim_id,
+            "closed": True,
+            "closed_on": claim.closed_on,
+            "stage": "已关闭",
+        }
+
+    def claim_view(self, claim_id: str, viewer_org: Optional[str] = None) -> dict[str, Any]:
+        """理赔案视图；未获授权的机构只能看到阶段等公开信息，敏感材料隐去。"""
+        claim = self._claim(claim_id)
+        if viewer_org is None or viewer_org not in self._claim_orgs(claim):
+            return {
+                "claim_id": claim.claim_id,
+                "work_id": claim.work_id,
+                "stage": self._claim_stage(claim),
+                "filed_on": claim.filed_on,
+                "closed": claim.closed,
+                "sensitive_redacted": True,
+                "message": "未获授权的机构看不到作品敏感材料",
+            }
+        return {
+            "claim_id": claim.claim_id,
+            "work_id": claim.work_id,
+            "incident_id": claim.incident_id,
+            "stage": self._claim_stage(claim),
+            "filed_on": claim.filed_on,
+            "filed_by": {
+                "org": claim.filed_by.org,
+                "role": claim.filed_by.role,
+                "person": claim.filed_by.person,
+            },
+            "insurer_org": claim.insurer_org,
+            "baseline": copy.deepcopy(claim.baseline),
+            "submissions": [self._submission_view(claim, s) for s in claim.submissions],
+            "decision": self._decision_view(claim.decision) if claim.decision else None,
+            "ledger": [self._entry_view(e) for e in claim.ledger],
+            "funds": self._funds_view(claim),
+            "restoration_review": {
+                "reviewed": claim.restoration_reviewed,
+                "note": claim.restoration_review_note,
+            },
+            "custody_acknowledgement": {
+                "acknowledged": claim.custody_acknowledged,
+                "by_org": claim.custody_ack_by,
+            },
+            "missing_signoffs": self._missing_signoffs(claim),
+            "closed": claim.closed,
+            "closed_on": claim.closed_on,
+        }
+
+    def _claim(self, claim_id: str) -> Claim:
+        claim = self.claims.get(claim_id)
+        if claim is None:
+            raise DomainError(f"理赔案 {claim_id} 不存在")
+        return claim
+
+    @staticmethod
+    def _claim_signature(raw: dict[str, Any]) -> Signature:
+        if not raw or not raw.get("person"):
+            raise DomainError("须指定签认人")
+        role = raw.get("role", "")
+        if role not in CLAIM_ROLES:
+            raise DomainError(f"理赔角色须为 {CLAIM_ROLES} 之一")
+        org = str(raw.get("org", "") or "").strip()
+        if not org:
+            raise DomainError("须指明机构")
+        return Signature(org=org, role=role, person=raw["person"])
+
+    def _claim_role_orgs(self, claim: Claim, role: str) -> set[str]:
+        """角色对应的法定机构：材料、决定与分录须由这些机构提交。"""
+        agreement = self.agreements[claim.baseline["agreement_id"]]
+        if role == "保险方":
+            return {claim.insurer_org}
+        if role == "出借馆":
+            return {agreement.lender_org}
+        if role == "承借馆":
+            return {agreement.borrower_org}
+        if role == "运输方":
+            return {
+                party.org
+                for h in self.handovers
+                if h.work_id == claim.work_id
+                for party in (h.from_party, h.to_party)
+                if party.role == "运输方" and party.org
+            }
+        return set()
+
+    def _assert_claim_party(
+        self, claim: Claim, raw: dict[str, Any], allowed_roles: tuple[str, ...]
+    ) -> Signature:
+        by = self._claim_signature(raw)
+        if by.role not in allowed_roles:
+            raise DomainError(f"该动作须由 {'、'.join(allowed_roles)} 办理，收到的是 {by.role}")
+        orgs = self._claim_role_orgs(claim, by.role)
+        if by.org not in orgs:
+            raise DomainError(f"{by.role}身份须由 {'、'.join(sorted(orgs))} 出面，收到 {by.org}")
+        return by
+
+    def _claim_orgs(self, claim: Claim) -> set[str]:
+        """有权查看理赔敏感材料的机构：出借馆、承借馆、保险方与运输方。"""
+        orgs = self._claim_role_orgs(claim, "出借馆")
+        orgs |= self._claim_role_orgs(claim, "承借馆")
+        orgs |= self._claim_role_orgs(claim, "运输方")
+        orgs.add(claim.insurer_org)
+        orgs.add(claim.filed_by.org)
+        return orgs
+
+    def _append_entry(
+        self,
+        claim: Claim,
+        kind: str,
+        amount_cents: int,
+        receipt_id: str,
+        by_org: str,
+        note: str,
+        recorded_on: str,
+    ) -> FundEntry:
+        if any(e.receipt_id == receipt_id for e in claim.ledger):
+            raise ConflictError(f"回执 {receipt_id} 已登记，重复回执不得多记赔款")
+        totals = self._fund_totals(claim)
+        if kind == "赔付" and totals["paid"] + amount_cents > totals["recognized"] - totals["deductible"]:
+            raise DomainError("赔付累计超过认可金额减去免赔额，破坏金额守恒")
+        if kind == "追偿" and totals["recovered"] + amount_cents > totals["paid"]:
+            raise DomainError("追偿累计超过已赔付金额，破坏金额守恒")
+        entry = FundEntry(
+            seq=len(claim.ledger) + 1,
+            kind=kind,
+            amount_cents=amount_cents,
+            receipt_id=receipt_id,
+            by_org=by_org,
+            note=note,
+            recorded_on=recorded_on,
+        )
+        claim.ledger.append(entry)
+        return entry
+
+    def _fund_totals(self, claim: Claim) -> dict[str, int]:
+        """金额守恒：认可 = 免赔 + 已付 + 待付；追偿不超过已付。"""
+        recognized = sum(e.amount_cents for e in claim.ledger if e.kind == "认可")
+        deductible = sum(e.amount_cents for e in claim.ledger if e.kind == "免赔")
+        paid = sum(e.amount_cents for e in claim.ledger if e.kind == "赔付")
+        recovered = sum(e.amount_cents for e in claim.ledger if e.kind == "追偿")
+        return {
+            "recognized": recognized,
+            "deductible": deductible,
+            "paid": paid,
+            "recovered": recovered,
+            "outstanding": recognized - deductible - paid,
+        }
+
+    def _funds_view(self, claim: Claim) -> dict[str, float]:
+        return {key: cents / 100 for key, cents in self._fund_totals(claim).items()}
+
+    def _claim_stage(self, claim: Claim) -> str:
+        if claim.closed:
+            return "已关闭"
+        if claim.decision is None:
+            has_estimate = any(s.kind == "估损" for s in claim.submissions)
+            return "定损中" if has_estimate else "已报案"
+        totals = self._fund_totals(claim)
+        if totals["paid"] <= 0:
+            return "已决定"
+        if totals["outstanding"] > 0:
+            return "赔付中"
+        return "已结清"
+
+    def _missing_signoffs(self, claim: Claim) -> list[str]:
+        """风险追溯用：还缺哪些签认（估损、决定、修复复核、保管责任确认）。"""
+        missing = []
+        if not any(s.kind == "估损" for s in claim.submissions):
+            missing.append("保险方估损")
+        if claim.decision is None:
+            missing.append("保险方理赔决定")
+        if not claim.restoration_reviewed:
+            missing.append("出借馆修复复核")
+        if not claim.custody_acknowledged:
+            custodian = self._custody(claim.work_id)["custodian_org"]
+            missing.append(f"{custodian}保管责任确认")
+        return missing
+
+    def _claim_summary_view(self, claim: Claim) -> dict[str, Any]:
+        return {
+            "claim_id": claim.claim_id,
+            "incident_id": claim.incident_id,
+            "stage": self._claim_stage(claim),
+            "filed_on": claim.filed_on,
+            "closed": claim.closed,
+            "restoration_reviewed": claim.restoration_reviewed,
+            "custody_acknowledged": claim.custody_acknowledged,
+            "missing_signoffs": self._missing_signoffs(claim),
+            "funds": self._funds_view(claim),
+        }
+
+    def _submission_view(self, claim: Claim, submission: ClaimSubmission) -> dict[str, Any]:
+        cited = claim.decision.cited_versions if claim.decision else []
+        return {
+            "version": submission.version,
+            "kind": submission.kind,
+            "by": {
+                "org": submission.by.org,
+                "role": submission.by.role,
+                "person": submission.by.person,
+            },
+            "summary": submission.summary,
+            "amount": submission.amount_cents / 100 if submission.amount_cents is not None else None,
+            "image_hashes": list(submission.image_hashes),
+            "submitted_on": submission.submitted_on,
+            "cited_by_decision": submission.version in cited,
+        }
+
+    @staticmethod
+    def _decision_view(decision: ClaimDecision) -> dict[str, Any]:
+        return {
+            "decided_by": {
+                "org": decision.by.org,
+                "role": decision.by.role,
+                "person": decision.by.person,
+            },
+            "approved_amount": decision.approved_cents / 100,
+            "deductible": decision.deductible_cents / 100,
+            "cited_versions": list(decision.cited_versions),
+            "decided_on": decision.decided_on,
+            "note": decision.note,
+        }
+
+    @staticmethod
+    def _entry_view(entry: FundEntry) -> dict[str, Any]:
+        return {
+            "seq": entry.seq,
+            "kind": entry.kind,
+            "amount": entry.amount_cents / 100,
+            "receipt_id": entry.receipt_id,
+            "by_org": entry.by_org,
+            "note": entry.note,
+            "recorded_on": entry.recorded_on,
+        }
+
+    @staticmethod
+    def _cents(value: Any, field_name: str = "金额") -> int:
+        """金额一律换算为分保存，避免浮点误差破坏守恒。"""
+        try:
+            return int(round(float(str(value)) * 100))
+        except (TypeError, ValueError):
+            raise DomainError(f"{field_name}须为数字")
 
     # -- 策展展签 ----------------------------------------------------------
 
@@ -649,24 +1232,38 @@ class LoanRegistry:
             "frozen": work_id in self._frozen_works,
         }
 
-    def risk_view(self, work_id: str) -> dict[str, Any]:
-        """从展签/策展侧回答：实体在哪、谁保管、授权到哪、风险是否解除。"""
+    def risk_view(self, work_id: str, viewer_org: Optional[str] = None) -> dict[str, Any]:
+        """风险追溯：开放损伤、理赔阶段、缺少的签认与资金变化并列呈现。
+
+        viewer_org 未获授权时，隐去图像摘要等作品敏感材料。
+        """
         work = self._work(work_id)
         agreement = self._current_agreement(work_id)
-        open_incidents = [i for i in self.incidents if i.work_id == work_id and not i.resolved]
+        authorized = viewer_org is None or viewer_org in self._work_orgs(work_id)
+        open_risks = []
+        for incident in self.incidents:
+            if incident.work_id != work_id or incident.resolved:
+                continue
+            item: dict[str, Any] = {
+                "incident_id": incident.incident_id,
+                "on_date": incident.on_date,
+                "note": incident.note,
+            }
+            if authorized:
+                item["before_hashes"] = incident.before_hashes
+                item["after_hashes"] = incident.after_hashes
+            else:
+                item["sensitive_redacted"] = True
+            open_risks.append(item)
         return {
             "work": work.to_ref(),
             "custody": self._custody(work_id),
             "authorization": agreement.authorization_scope() if agreement else None,
-            "open_risks": [
-                {
-                    "incident_id": i.incident_id,
-                    "on_date": i.on_date,
-                    "note": i.note,
-                    "before_hashes": i.before_hashes,
-                    "after_hashes": i.after_hashes,
-                }
-                for i in open_incidents
+            "open_risks": open_risks,
+            "claims": [
+                self._claim_summary_view(claim)
+                for claim in self.claims.values()
+                if claim.work_id == work_id
             ],
             "frozen": work_id in self._frozen_works,
         }
@@ -750,6 +1347,23 @@ class LoanRegistry:
         if not history:
             return None
         return self.agreements[history[-1]]
+
+    def _work_orgs(self, work_id: str) -> set[str]:
+        """有权查看作品敏感材料的机构：权属、协议双方、运输方与保险方。"""
+        orgs = {self.works[work_id].owner_org}
+        agreement = self._current_agreement(work_id)
+        if agreement:
+            orgs.update([agreement.lender_org, agreement.borrower_org])
+        for handover in self.handovers:
+            if handover.work_id == work_id:
+                for party in (handover.from_party, handover.to_party):
+                    if party.org:
+                        orgs.add(party.org)
+        for claim in self.claims.values():
+            if claim.work_id == work_id:
+                orgs.add(claim.insurer_org)
+                orgs.add(claim.filed_by.org)
+        return orgs
 
     def _work(self, work_id: str) -> Work:
         work = self.works.get(work_id)
@@ -844,7 +1458,8 @@ def build_routes() -> list[Route]:
             body.get("segments"), body.get("contributions"),
         )),
         Route("GET", r"^/works/(?P<id>[^/]+)$", lambda reg, _b, p: reg.get_work_view(p["id"])),
-        Route("GET", r"^/works/(?P<id>[^/]+)/risk$", lambda reg, _b, p: reg.risk_view(p["id"])),
+        Route("GET", r"^/works/(?P<id>[^/]+)/risk$",
+              lambda reg, _b, p: reg.risk_view(p["id"], p.get("viewer_org"))),
         Route("GET", r"^/works/(?P<id>[^/]+)/segments/(?P<sid>[^/]+)$",
               lambda reg, _b, p: reg.locate_segment(p["id"], p["sid"])),
         Route("POST", r"^/agreements$", lambda reg, body, _: reg.create_agreement(body)),
@@ -853,6 +1468,21 @@ def build_routes() -> list[Route]:
         Route("POST", r"^/handovers$", lambda reg, body, _: reg.record_handover(body)),
         Route("POST", r"^/incidents/(?P<id>[^/]+)/resolve$",
               lambda reg, body, p: reg.resolve_incident(p["id"], body.get("resolution_note", ""))),
+        Route("POST", r"^/claims$", lambda reg, body, _: reg.file_claim(body)),
+        Route("GET", r"^/claims/(?P<id>[^/]+)$",
+              lambda reg, _b, p: reg.claim_view(p["id"], p.get("viewer_org"))),
+        Route("POST", r"^/claims/(?P<id>[^/]+)/submissions$",
+              lambda reg, body, p: reg.add_submission(p["id"], body)),
+        Route("POST", r"^/claims/(?P<id>[^/]+)/decide$",
+              lambda reg, body, p: reg.decide_claim(p["id"], body)),
+        Route("POST", r"^/claims/(?P<id>[^/]+)/entries$",
+              lambda reg, body, p: reg.append_entry(p["id"], body)),
+        Route("POST", r"^/claims/(?P<id>[^/]+)/restoration-review$",
+              lambda reg, body, p: reg.review_restoration(p["id"], body)),
+        Route("POST", r"^/claims/(?P<id>[^/]+)/custody-ack$",
+              lambda reg, body, p: reg.acknowledge_custody(p["id"], body)),
+        Route("POST", r"^/claims/(?P<id>[^/]+)/close$",
+              lambda reg, body, p: reg.close_claim(p["id"], body)),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels$",
               lambda reg, body, p: reg.create_label(p["id"], body["narrative"], body.get("citations", []))),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels/publish$",

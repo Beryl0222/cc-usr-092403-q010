@@ -8,6 +8,7 @@ import argparse
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl
 
 from domain import (
     ConflictError,
@@ -47,7 +48,8 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def _dispatch(self, method):
-        if method == "GET" and self.path == "/health":
+        path, _, query = self.path.partition("?")
+        if method == "GET" and path == "/health":
             self._write_json(200, health_payload())
             return
 
@@ -67,11 +69,14 @@ class Handler(BaseHTTPRequestHandler):
         for route in STATE.routes:  # type: Route
             if route.method != method:
                 continue
-            match = re.match(route.pattern + r"$", self.path)
+            match = re.match(route.pattern + r"$", path)
             if not match:
                 continue
+            params = match.groupdict()
+            if query:
+                params.update(dict(parse_qsl(query)))
             try:
-                payload = route.handler(STATE.registry, body, match.groupdict())
+                payload = route.handler(STATE.registry, body, params)
             except ConflictError as error:
                 self._write_json(409, {"error": str(error)})
             except DomainError as error:
