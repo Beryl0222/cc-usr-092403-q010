@@ -8,6 +8,7 @@ import argparse
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 from domain import (
     ConflictError,
@@ -70,8 +71,11 @@ class Handler(BaseHTTPRequestHandler):
             match = re.match(route.pattern + r"$", self.path)
             if not match:
                 continue
+            # 查看机构由 X-Viewer-Org 声明（HTTP 头仅支持 latin-1，故百分号编码中文机构名）
+            raw_view = self.headers.get("X-Viewer-Org")
+            viewer_org = unquote(raw_view) if raw_view else None
             try:
-                payload = route.handler(STATE.registry, body, match.groupdict())
+                payload = route.handler(STATE.registry, body, match.groupdict(), viewer_org)
             except ConflictError as error:
                 self._write_json(409, {"error": str(error)})
             except DomainError as error:

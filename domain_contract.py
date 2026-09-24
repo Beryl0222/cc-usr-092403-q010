@@ -6,10 +6,16 @@
 - 五种交接的双方签认与生命周期顺序；
 - 重复扫码幂等；
 - 损伤即冻结、前后图像哈希保全；
+- 理赔报案锁定事故时有效条款/签认/图像摘要；四方按角色追加、版本不替换；
+- 资金分录守恒（免赔额、分期赔付、追偿），重复回执与并发决定不多记；
+- 理赔关闭与作品解冻分别判断，修复复核+保管责任双闸门才恢复交接；
+- 风险追溯并列呈现开放损伤、理赔阶段、缺少的签认与资金变化；
+- 未获授权机构看不到作品敏感材料；
 - 展签发布即锁定证据快照，学术更正只另起新版；
 - 跨馆改期与局部状态争议下，从展签/区段定位实体、保管、授权与风险。
 """
 
+import threading
 import unittest
 
 from domain import (
@@ -18,6 +24,11 @@ from domain import (
     DomainError,
     LoanRegistry,
 )
+
+INSURER_ORG = "安保保险"
+TRANSPORTER_ORG = "长风运输"
+LENDER_ORG = "甲馆"
+BORROWER_ORG = "乙馆"
 
 
 def make_long_scroll(registry: LoanRegistry) -> dict:
@@ -89,6 +100,95 @@ def handover_payload(work_id: str, htype: str, scan: str, on_date: str,
         "to_party": {"org": torg, "role": tr, "person": to_person},
         "report": report or {"condition": "良好", "image_hashes": ["出库全景照"]},
         "linked_segments": linked_segments or [],
+    }
+
+
+def damage_arrival(registry: LoanRegistry, work_id: str,
+                   note="画心左下角发现新增折痕") -> str:
+    """出库正常、到馆发现损伤，返回 incident_id。"""
+    registry.record_handover(
+        handover_payload(work_id, "出库", "SCAN-1", "2026-09-25"))
+    registry.record_handover(handover_payload(
+        work_id, "到馆", "SCAN-2", "2026-09-27",
+        report={"condition": "损伤", "damage_note": note,
+                "image_hashes": ["到馆检视照"],
+                "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+    ))
+    return registry.risk_view(work_id)["open_risks"][0]["incident_id"]
+
+
+def file_claim(registry: LoanRegistry, incident_id: str, **overrides) -> dict:
+    payload = {
+        "org": LENDER_ORG,
+        "insurer_org": INSURER_ORG,
+        "filed_on": "2026-09-28",
+    }
+    payload.update(overrides)
+    return registry.file_claim(incident_id, payload, viewer_org=payload["org"])
+
+
+def setup_claim(registry: LoanRegistry, work_id: str, incident_id: str) -> str:
+    return file_claim(registry, incident_id)["claim_id"]
+
+
+def insurer_payload(on_date: str, note: str = "", **extra) -> dict:
+    payload = {"org": INSURER_ORG, "role": "保险方", "person": "理赔员丁", "on_date": on_date}
+    if note:
+        payload["note"] = note
+    payload.update(extra)
+    return payload
+
+
+def assessment_material(on_date: str, amount: float) -> dict:
+    payload = insurer_payload(on_date, summary="现场查勘估损", amount=amount)
+    payload["kind"] = "估损"
+    return payload
+
+
+def decision_material(on_date: str, decision: str, accepted: float, deductible: float = 0.0) -> dict:
+    payload = insurer_payload(
+        on_date, summary=f"{decision}通知",
+        decision=decision, accepted_amount=accepted, deductible_amount=deductible,
+    )
+    payload["kind"] = "核赔结论"
+    return payload
+
+
+def run_assessment_and_partial_decision(registry: LoanRegistry, claim_id: str,
+                                        assessed: float = 100000.0,
+                                        accepted: float = 90000.0,
+                                        deductible: float = 10000.0) -> None:
+    registry.add_claim_material(claim_id, assessment_material("2026-10-01", assessed))
+    registry.add_claim_material(
+        claim_id, decision_material("2026-10-03", "部分认可", accepted, deductible))
+
+
+def pay_installments(registry: LoanRegistry, claim_id: str, receipts: list[tuple[str, float]]) -> None:
+    base = sum(1 for e in registry._claim(claim_id).fund_entries if e.kind == "赔付")
+    for idx, (receipt, amount) in enumerate(receipts, start=1):
+        registry.add_fund_entry(claim_id, {
+            "kind": "赔付", "amount": amount, "receipt_no": receipt,
+            "installment_no": base + idx, "on_date": f"2026-10-{base + idx + 4:02d}",
+            "org": INSURER_ORG, "role": "保险方", "person": "出纳",
+        })
+
+
+def restoration_plan_material(on_date: str) -> dict:
+    return {
+        "kind": "修复方案", "org": BORROWER_ORG, "role": "承借馆",
+        "person": "修复师丙", "on_date": on_date,
+        "summary": "托裱加固折痕，最小干预，可逆材料",
+    }
+
+
+def restoration_review_payload(on_date: str) -> dict:
+    return {
+        "on_date": on_date,
+        "note": "双方馆员与修复师书面复核，修复达到继续交接条件",
+        "reviewers": [
+            {"org": LENDER_ORG, "role": "出借馆", "person": "馆员甲"},
+            {"org": BORROWER_ORG, "role": "承借馆", "person": "馆员乙"},
+        ],
     }
 
 
@@ -291,20 +391,418 @@ class DamageAndFreezeTest(unittest.TestCase):
                 report={"condition": "损伤", "image_hashes": ["x"]},
             ))
 
-    def test_incident_can_be_resolved_then_chain_resumes(self):
+    def test_claim_close_and_unfreeze_are_judged_separately(self):
+        """修复完成不等于自动解冻，理赔关闭也不解冻；必须双闸门同时满足。"""
         self.registry.record_handover(handover_payload(
             self.work_id, "到馆", "SCAN-2", "2026-09-27",
             report={"condition": "损伤", "damage_note": "边缘轻微磨损",
                     "before_hashes": ["c" * 64], "after_hashes": ["d" * 64]},
         ))
-        incident = self.registry.risk_view(self.work_id)["open_risks"][0]
+        incident_id = self.registry.risk_view(self.work_id)["open_risks"][0]["incident_id"]
+        claim_id = setup_claim(self.registry, self.work_id, incident_id)
+        run_assessment_and_partial_decision(self.registry, claim_id)
+        pay_installments(self.registry, claim_id, [("RCPT-1", 60000)])
+
+        # 只过修复闸门：仍冻结。
+        self.registry.add_claim_material(claim_id, restoration_plan_material("2026-10-02"))
+        self.registry.submit_restoration_review(incident_id, restoration_review_payload("2026-10-10"))
+        self.assertTrue(self.registry.get_work_view(self.work_id)["frozen"])
+        gate = self.registry.incident_view(incident_id)
+        self.assertTrue(gate["restoration_reviewed"])
+        self.assertFalse(gate["custody_confirmed"])
+
+        # 承借馆想在修复完成后直接解除冻结：不允许，必须先由当前保管方签认。
         with self.assertRaises(DomainError):
-            self.registry.resolve_incident(incident["incident_id"], "  ")
-        result = self.registry.resolve_incident(incident["incident_id"], "修复师与双方馆员复核，确认可继续展出")
-        self.assertTrue(result["resolved"])
+            self.registry.record_handover(
+                handover_payload(self.work_id, "布展", "SCAN-3", "2026-10-11"))
+
+        # 理赔关闭本身也不解冻。
+        pay_installments(self.registry, claim_id, [("RCPT-2", 30000)])
+        self.registry.close_claim(claim_id, insurer_payload("2026-10-12", note="赔款付清，关闭"))
+        self.assertTrue(self.registry.claim_view(claim_id)["closed"])
+        self.assertTrue(self.registry.get_work_view(self.work_id)["frozen"])
+
+        # 第二道闸门（当前保管方为承借馆）签认后才解冻。
+        self.registry.confirm_custody(incident_id, {
+            "org": "乙馆", "role": "承借馆", "person": "保管员乙",
+            "on_date": "2026-10-12", "note": "确认修复后现状，接管后续保管",
+        })
         self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
         self.registry.record_handover(
-            handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+            handover_payload(self.work_id, "布展", "SCAN-3", "2026-10-13"))
+
+    def test_restoration_review_requires_both_lender_and_borrower(self):
+        self.registry.record_handover(handover_payload(
+            self.work_id, "到馆", "SCAN-2", "2026-09-27",
+            report={"condition": "损伤", "damage_note": "磨损",
+                    "before_hashes": ["c" * 64], "after_hashes": ["d" * 64]},
+        ))
+        incident_id = self.registry.risk_view(self.work_id)["open_risks"][0]["incident_id"]
+        self.registry.add_claim_material(
+            setup_claim(self.registry, self.work_id, incident_id),
+            restoration_plan_material("2026-10-02"),
+        )
+        # 只有承借馆一方签字：拒绝。
+        with self.assertRaises(DomainError):
+            self.registry.submit_restoration_review(incident_id, {
+                "on_date": "2026-10-10", "note": "复核通过",
+                "reviewers": [{"org": "乙馆", "role": "承借馆", "person": "乙"}],
+            })
+        # 运输方不能替代出借馆签字。
+        with self.assertRaises(DomainError):
+            self.registry.submit_restoration_review(incident_id, {
+                "on_date": "2026-10-10", "note": "复核通过",
+                "reviewers": [
+                    {"org": "长风运输", "role": "运输方", "person": "司机"},
+                    {"org": "乙馆", "role": "承借馆", "person": "乙"},
+                ],
+            })
+
+    def test_custody_confirmation_must_come_from_current_custodian(self):
+        self.registry.record_handover(handover_payload(
+            self.work_id, "到馆", "SCAN-2", "2026-09-27",
+            report={"condition": "损伤", "damage_note": "磨损",
+                    "before_hashes": ["c" * 64], "after_hashes": ["d" * 64]},
+        ))
+        incident_id = self.registry.risk_view(self.work_id)["open_risks"][0]["incident_id"]
+        setup_claim(self.registry, self.work_id, incident_id)
+        # 事故停在到馆之后，保管方是承借馆；运输方来签认保管责任应被拒绝。
+        with self.assertRaises(DomainError):
+            self.registry.confirm_custody(incident_id, {
+                "org": "长风运输", "role": "运输方", "person": "司机",
+                "on_date": "2026-10-12", "note": "我们接管",
+            })
+
+
+class ClaimBaselineTest(unittest.TestCase):
+    """报案必须锁定事故时有效的保险条款、双方签认与图像摘要。"""
+
+    def setUp(self):
+        self.registry = LoanRegistry()
+        work = self.registry.register_work("秋林群鹿", "独立作品", LENDER_ORG)
+        self.work_id = work["work"]["work_id"]
+        self.agreement = self.registry.create_agreement(agreement_payload(self.work_id))
+        self.incident_id = damage_arrival(self.registry, self.work_id)
+
+    def test_claim_locks_insurance_terms_signatures_and_image_summary(self):
+        claim = file_claim(self.registry, self.incident_id)
+        baseline = claim["baseline"]
+        self.assertTrue(baseline["locked"])
+        # 事故时有效的是 v1 协议（钉到钉），且双方已签认
+        self.assertEqual(baseline["agreement_version"]["version"], 1)
+        self.assertEqual(baseline["agreement_version"]["insurance"]["coverage"], "钉到钉")
+        self.assertTrue(baseline["signatures"])
+        self.assertEqual(baseline["image_summary"]["before_hashes"], ["a" * 64])
+        self.assertEqual(baseline["image_summary"]["after_hashes"], ["b" * 64])
+        handover_hashes = baseline["image_summary"]["handover_image_hashes"]
+        self.assertIn(LoanRegistry._image_hash("到馆检视照"), handover_hashes)
+        # 四方按角色固定
+        self.assertEqual(claim["parties"]["保险方"], INSURER_ORG)
+        self.assertEqual(claim["parties"]["出借馆"], LENDER_ORG)
+        self.assertEqual(claim["parties"]["承借馆"], BORROWER_ORG)
+        self.assertEqual(claim["parties"]["运输方"], TRANSPORTER_ORG)
+
+    def test_duplicate_report_rejected(self):
+        file_claim(self.registry, self.incident_id)
+        with self.assertRaises(ConflictError):
+            file_claim(self.registry, self.incident_id)
+
+    def test_non_party_cannot_file_claim(self):
+        with self.assertRaises(DomainError):
+            self.registry.file_claim(self.incident_id, {
+                "org": "无关拍卖行", "insurer_org": INSURER_ORG, "filed_on": "2026-09-28",
+            }, viewer_org="无关拍卖行")
+
+    def test_later_reschedule_does_not_change_locked_coverage(self):
+        """出借馆事后拿出新协议、协议后来改期，都不改变原保障范围。"""
+        claim = file_claim(self.registry, self.incident_id)
+        self.registry.reschedule_agreement(
+            self.agreement["agreement_id"],
+            {"insurance": {"insured_value": "议定价值", "coverage": "馆内责任险", "policy": "POL-002"}},
+        )
+        view = self.registry.claim_view(claim["claim_id"], LENDER_ORG)
+        self.assertEqual(view["baseline"]["agreement_version"]["insurance"]["coverage"], "钉到钉")
+        # 当前授权确实已是新版，但报案基线不动
+        risk = self.registry.risk_view(self.work_id, LENDER_ORG)
+        self.assertEqual(risk["authorization"]["insurance"]["coverage"], "馆内责任险")
+
+    def test_claim_without_effective_agreement_rejected(self):
+        registry = LoanRegistry()
+        work = registry.register_work("无协议作品", "独立作品", LENDER_ORG)
+        wid = work["work"]["work_id"]
+        # 无协议直接出库/到馆出损伤，不能报案
+        registry.record_handover(
+            handover_payload(wid, "出库", "SCAN-1", "2026-09-25"))
+        registry.record_handover(handover_payload(
+            wid, "到馆", "SCAN-2", "2026-09-27",
+            report={"condition": "损伤", "damage_note": "折痕",
+                    "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+        ))
+        incident_id = registry.risk_view(wid)["open_risks"][0]["incident_id"]
+        with self.assertRaises(DomainError):
+            registry.file_claim(incident_id, {
+                "org": LENDER_ORG, "insurer_org": INSURER_ORG, "filed_on": "2026-09-28",
+            })
+
+
+class ClaimAdditionsTest(unittest.TestCase):
+    """四方只能按自身角色追加；补充材料形成新版本，不替换已引用证据。"""
+
+    def setUp(self):
+        self.registry = LoanRegistry()
+        work = self.registry.register_work("秋林群鹿", "独立作品", LENDER_ORG)
+        self.work_id = work["work"]["work_id"]
+        self.registry.create_agreement(agreement_payload(self.work_id))
+        self.incident_id = damage_arrival(self.registry, self.work_id)
+        self.claim_id = setup_claim(self.registry, self.work_id, self.incident_id)
+
+    def test_each_role_can_only_add_its_own_kind(self):
+        # 承借馆不能替保险方估损
+        with self.assertRaises(DomainError):
+            self.registry.add_claim_material(self.claim_id, {
+                "kind": "估损", "org": BORROWER_ORG, "role": "承借馆",
+                "person": "乙", "on_date": "2026-10-01",
+                "summary": "我们自己估 5 万", "amount": 50000,
+            })
+        # 运输方不能提交修复方案
+        with self.assertRaises(DomainError):
+            self.registry.add_claim_material(self.claim_id, {
+                "kind": "修复方案", "org": TRANSPORTER_ORG, "role": "运输方",
+                "person": "司机", "on_date": "2026-10-01", "summary": "运回去擦擦",
+            })
+        # 角色与报案登记机构不符也不行（别的运输公司不能冒充）
+        with self.assertRaises(DomainError):
+            self.registry.add_claim_material(self.claim_id, {
+                "kind": "责任意见", "org": "别的运输公司", "role": "运输方",
+                "person": "陌生人", "on_date": "2026-10-01", "summary": "与我无关",
+            })
+
+    def test_dispute_restoration_plan_and_liability_append_as_versions(self):
+        # 运输方引用另一版交接照片提出责任意见
+        self.registry.add_claim_material(self.claim_id, {
+            "kind": "责任意见", "org": TRANSPORTER_ORG, "role": "运输方",
+            "person": "车长老路", "on_date": "2026-09-29",
+            "summary": "引用到馆卸货另一版照片，认为外包装到馆前完好",
+            "image_hashes": ["运输方交接照片"],
+        })
+        # 出借馆对损伤提出异议
+        self.registry.add_claim_material(self.claim_id, {
+            "kind": "异议", "org": LENDER_ORG, "role": "出借馆",
+            "person": "馆员甲", "on_date": "2026-09-30",
+            "summary": "不认可运输方照片版本，损伤发生在运输环节",
+        })
+        # 承借馆给修复方案，随后修订：旧版保留
+        plan = self.registry.add_claim_material(
+            self.claim_id, restoration_plan_material("2026-10-02"))
+        revised = self.registry.add_claim_material(self.claim_id, {
+            **restoration_plan_material("2026-10-04"),
+            "summary": "按纤维检测改为仅局部加固（修订版）",
+            "supersedes_seq": plan["additions"][-1]["seq"],
+        })
+        claim = self.registry.claim_view(self.claim_id, BORROWER_ORG)
+        kinds = [a["kind"] for a in claim["additions"]]
+        self.assertEqual(kinds, ["责任意见", "异议", "修复方案", "修复方案"])
+        self.assertEqual(revised["additions"][-1]["supersedes_seq"], 3)
+        # 被取代的第 3 版仍然原样可查
+        self.assertEqual(claim["additions"][2]["summary"], "托裱加固折痕，最小干预，可逆材料")
+        self.assertNotIn("redacted", claim["additions"][2])
+
+    def test_no_additions_after_close(self):
+        run_assessment_and_partial_decision(self.registry, self.claim_id)
+        pay_installments(self.registry, self.claim_id, [("R-1", 90000)])
+        self.registry.close_claim(self.claim_id, insurer_payload("2026-10-12", note="结清关闭"))
+        with self.assertRaises(ConflictError):
+            self.registry.add_claim_material(
+                self.claim_id, restoration_plan_material("2026-10-13"))
+
+
+class ClaimFundsTest(unittest.TestCase):
+    """部分认可、免赔额、分期赔付与追偿还需金额守恒。"""
+
+    def setUp(self):
+        self.registry = LoanRegistry()
+        work = self.registry.register_work("秋林群鹿", "独立作品", LENDER_ORG)
+        self.work_id = work["work"]["work_id"]
+        self.registry.create_agreement(agreement_payload(self.work_id))
+        self.incident_id = damage_arrival(self.registry, self.work_id)
+        self.claim_id = setup_claim(self.registry, self.work_id, self.incident_id)
+
+    def test_deductible_installments_and_recovery_keep_amounts_consistent(self):
+        run_assessment_and_partial_decision(
+            self.registry, self.claim_id,
+            assessed=100000, accepted=90000, deductible=10000)
+        claim = self.registry.claim_view(self.claim_id, INSURER_ORG)
+        # 免赔额在决定作出时即作为负向分录落账
+        self.assertEqual([e["kind"] for e in claim["fund_entries"]], ["免赔额"])
+        self.assertEqual(claim["fund_totals"]["deductible"], 10000)
+
+        # 分期赔付 6 万 + 3 万
+        pay_installments(self.registry, self.claim_id, [("RCPT-1", 60000), ("RCPT-2", 30000)])
+        totals = self.registry.fund_totals(self.claim_id)
+        self.assertEqual(totals["paid"], 90000)
+        self.assertEqual(totals["outstanding"], 0)
+
+        # 之后向运输方追偿收回 4 万，净额相应减少
+        self.registry.add_fund_entry(self.claim_id, {
+            "kind": "追偿", "amount": 40000, "receipt_no": "REC-1",
+            "on_date": "2026-11-02",
+            "org": INSURER_ORG, "role": "保险方", "person": "追偿专员",
+        })
+        totals = self.registry.fund_totals(self.claim_id)
+        self.assertEqual(totals["recovered"], 40000)
+        self.assertEqual(totals["net_paid"], 50000)
+        # 追偿不能超过已赔未冲减部分
+        with self.assertRaises(DomainError):
+            self.registry.add_fund_entry(self.claim_id, {
+                "kind": "追偿", "amount": 50001, "receipt_no": "REC-2",
+                "on_date": "2026-11-03",
+                "org": INSURER_ORG, "role": "保险方", "person": "追偿专员",
+            })
+
+    def test_duplicate_receipt_does_not_double_count(self):
+        run_assessment_and_partial_decision(self.registry, self.claim_id)
+        pay_installments(self.registry, self.claim_id, [("RCPT-DUP", 45000)])
+        # 同一回执号再来一次（哪怕标成第 2 期）：拒绝，不产生第二条分录
+        with self.assertRaises(ConflictError):
+            self.registry.add_fund_entry(self.claim_id, {
+                "kind": "赔付", "amount": 45000, "receipt_no": "RCPT-DUP",
+                "installment_no": 2, "on_date": "2026-10-08",
+                "org": INSURER_ORG, "role": "保险方", "person": "出纳",
+            })
+        # 同一分期重复入账也拒绝
+        with self.assertRaises(ConflictError):
+            self.registry.add_fund_entry(self.claim_id, {
+                "kind": "赔付", "amount": 45000, "receipt_no": "RCPT-OTHER",
+                "installment_no": 1, "on_date": "2026-10-08",
+                "org": INSURER_ORG, "role": "保险方", "person": "出纳",
+            })
+        totals = self.registry.fund_totals(self.claim_id)
+        self.assertEqual(totals["paid"], 45000)
+
+    def test_payment_cannot_exceed_accepted_amount(self):
+        run_assessment_and_partial_decision(self.registry, self.claim_id)
+        with self.assertRaises(DomainError):
+            pay_installments(self.registry, self.claim_id, [("RCPT-X", 90001)])
+
+    def test_concurrent_decisions_only_one_is_recorded(self):
+        """两个核赔决定并发到达：只有一个生效，不重复扣免赔额。"""
+        self.registry.add_claim_material(
+            self.claim_id, assessment_material("2026-10-01", 100000))
+        decision = decision_material("2026-10-03", "部分认可", 90000, 10000)
+        outcomes = []
+
+        def decide():
+            try:
+                self.registry.add_claim_material(self.claim_id, dict(decision))
+                outcomes.append("ok")
+            except ConflictError:
+                outcomes.append("conflict")
+
+        threads = [threading.Thread(target=decide) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(outcomes), ["conflict", "ok"])
+        totals = self.registry.fund_totals(self.claim_id)
+        self.assertEqual(totals["deductible"], 10000)
+        self.assertEqual(self.registry.claim_view(self.claim_id)["stage"], "部分认可")
+
+    def test_cannot_pay_before_decision(self):
+        with self.assertRaises(ConflictError):
+            pay_installments(self.registry, self.claim_id, [("RCPT-0", 1000)])
+
+    def test_rejected_decision_allows_close_without_payment(self):
+        self.registry.add_claim_material(
+            self.claim_id, assessment_material("2026-10-01", 100000))
+        self.registry.add_claim_material(
+            self.claim_id, decision_material("2026-10-03", "拒赔", 0))
+        self.assertEqual(self.registry.fund_totals(self.claim_id)["outstanding"], 0)
+        closed = self.registry.close_claim(
+            self.claim_id, insurer_payload("2026-10-05", note="拒赔关闭"))
+        self.assertTrue(closed["closed"])
+
+    def test_close_blocked_while_installments_outstanding(self):
+        run_assessment_and_partial_decision(self.registry, self.claim_id)
+        pay_installments(self.registry, self.claim_id, [("RCPT-1", 60000)])
+        with self.assertRaises(ConflictError):
+            self.registry.close_claim(
+                self.claim_id, insurer_payload("2026-10-12", note="想提前关闭"))
+
+    def test_full_approval_amount_must_match_assessed_minus_deductible(self):
+        self.registry.add_claim_material(
+            self.claim_id, assessment_material("2026-10-01", 100000))
+        with self.assertRaises(DomainError):
+            self.registry.add_claim_material(
+                self.claim_id, decision_material("2026-10-03", "全额认可", 80000, 10000))
+
+
+class RiskTraceAndRedactionTest(unittest.TestCase):
+    """风险追溯并列四要素；未授权机构脱敏。"""
+
+    def setUp(self):
+        self.registry = LoanRegistry()
+        work = self.registry.register_work("秋林群鹿", "独立作品", LENDER_ORG)
+        self.work_id = work["work"]["work_id"]
+        self.registry.create_agreement(agreement_payload(self.work_id))
+        self.incident_id = damage_arrival(self.registry, self.work_id)
+        self.claim_id = setup_claim(self.registry, self.work_id, self.incident_id)
+
+    def test_risk_view_presents_all_four_facets_side_by_side(self):
+        run_assessment_and_partial_decision(self.registry, self.claim_id)
+        pay_installments(self.registry, self.claim_id, [("RCPT-1", 60000)])
+        risk = self.registry.risk_view(self.work_id, LENDER_ORG)
+        block = risk["open_risks"][0]
+        # 1) 开放损伤
+        self.assertIn("折痕", block["note"])
+        self.assertEqual(block["before_hashes"], ["a" * 64])
+        # 2) 理赔阶段
+        self.assertEqual(block["claim_stage"], "部分认可")
+        self.assertFalse(block["claim_closed"])
+        # 3) 缺少的签认
+        missing = block["missing_signatures"]
+        self.assertIn("承借馆修复方案", missing)
+        self.assertTrue(any(m.startswith("修复复核") for m in missing))
+        self.assertTrue(any(m.startswith("保管责任") for m in missing))
+        self.assertTrue(any("分期赔付" in m for m in missing))
+        # 4) 资金变化
+        kinds = [(e["kind"], e["amount"]) for e in block["fund_changes"]]
+        self.assertIn(("免赔额", 10000), kinds)
+        self.assertIn(("赔付", 60000), kinds)
+        self.assertEqual(block["fund_totals"]["outstanding"], 30000)
+        # 闸门状态并列
+        self.assertFalse(block["gates"]["restoration_reviewed"])
+        self.assertFalse(block["gates"]["custody_confirmed"])
+
+    def test_unauthorized_org_cannot_see_sensitive_material(self):
+        run_assessment_and_partial_decision(self.registry, self.claim_id)
+        self.registry.add_claim_material(
+            self.claim_id, restoration_plan_material("2026-10-02"))
+        # 未授权机构看理赔：基线图像/条款、材料摘要全部脱敏
+        view = self.registry.claim_view(self.claim_id, "某小报")
+        self.assertFalse(view["authorized"])
+        self.assertTrue(view["baseline"]["image_summary"]["redacted"])
+        self.assertTrue(view["baseline"]["agreement_version"]["redacted"])
+        self.assertTrue(all(a.get("redacted") for a in view["additions"]))
+        # 看不到其他三方
+        self.assertEqual(set(view["parties"].keys()), {"保险方"})
+        # 风险视图同样脱敏
+        risk = self.registry.risk_view(self.work_id, "某小报")
+        block = risk["open_risks"][0]
+        self.assertTrue(block["redacted"])
+        self.assertNotIn("before_hashes", block)
+        self.assertEqual(block["fund_changes"], [])
+        # 但阶段与缺口这种非敏感状态仍可见，便于协作方知道卡在哪
+        self.assertEqual(block["claim_stage"], "部分认可")
+        self.assertTrue(block["missing_signatures"])
+
+    def test_parties_see_full_material(self):
+        for org in (INSURER_ORG, LENDER_ORG, BORROWER_ORG, TRANSPORTER_ORG):
+            view = self.registry.claim_view(self.claim_id, org)
+            self.assertTrue(view["authorized"], org)
+            self.assertEqual(view["baseline"]["image_summary"]["before_hashes"], ["a" * 64])
+            self.assertEqual(set(view["parties"].keys()),
+                             {"保险方", "出借馆", "承借馆", "运输方"})
 
 
 class LabelSnapshotTest(unittest.TestCase):
